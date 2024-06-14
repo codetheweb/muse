@@ -1,7 +1,7 @@
 import {VoiceChannel, Snowflake} from 'discord.js';
 import {Readable} from 'stream';
 import hasha from 'hasha';
-import ytdl, {videoFormat} from 'ytdl-core';
+import {InfoData, video_info, stream_from_info} from 'play-dl';
 import {WriteStream} from 'fs-capacitor';
 import ffmpeg from 'fluent-ffmpeg';
 import shuffle from 'array-shuffle';
@@ -57,8 +57,6 @@ export interface PlayerEvents {
   statusChange: (oldStatus: STATUS, newStatus: STATUS) => void;
 }
 
-type YTDLVideoFormat = videoFormat & {loudnessDb?: number};
-
 export const DEFAULT_VOLUME = 100;
 
 export default class {
@@ -77,6 +75,8 @@ export default class {
   private nowPlaying: QueuedSong | null = null;
   private playPositionInterval: NodeJS.Timeout | undefined;
   private lastSongURL = '';
+  private type: StreamType | undefined;
+  private loudness = 1;
 
   private positionInSeconds = 0;
   private readonly fileCache: FileCacheProvider;
@@ -443,28 +443,37 @@ export default class {
     const ffmpegInputOptions: string[] = [];
     let shouldCacheVideo = false;
 
-    let format: YTDLVideoFormat | undefined;
+    let format: InfoData['format'][0] | undefined;
 
     ffmpegInput = await this.fileCache.getPathFor(this.getHashForCache(song.url));
 
     if (!ffmpegInput) {
       // Not yet cached, must download
-      const info = await ytdl.getInfo(song.url);
+      const info = await video_info(song.url);
 
-      const formats = info.formats as YTDLVideoFormat[];
+      // Don't cache livestreams or long videos
+      const MAX_CACHE_LENGTH_SECONDS = 30 * 60; // 30 minutes
+      shouldCacheVideo = !info.video_details.live && info.video_details.durationInSec < MAX_CACHE_LENGTH_SECONDS && !options.seek;
 
-      const filter = (format: ytdl.videoFormat): boolean => format.codecs === 'opus' && format.container === 'webm' && format.audioSampleRate !== undefined && parseInt(format.audioSampleRate, 10) === 48000;
+      format = info.format.at(info.format.length - 1);
 
-      format = formats.find(filter);
+      if (!shouldCacheVideo) {
+        const stream = await stream_from_info(info, {seek: options.seek});
+        debug('Not caching video');
+        debug('Spawned play-dl stream');
+        this.loudness = format?.loudnessDb ?? 0;
+        debug('isLive:', info.video_details.live);
+        debug('LoudnessDb:', this.loudness);
+        this.loudness = 2 ** (-this.loudness / 10);
 
-      const nextBestFormat = (formats: ytdl.videoFormat[]): ytdl.videoFormat | undefined => {
-        if (formats[0].isLive) {
-          formats = formats.sort((a, b) => (b as unknown as {audioBitrate: number}).audioBitrate - (a as unknown as {audioBitrate: number}).audioBitrate); // Bad typings
+        debug('Audio format:', stream.type);
+        this.type = stream.type;
 
-          return formats.find(format => [128, 127, 120, 96, 95, 94, 93].includes(parseInt(format.itag as unknown as string, 10))); // Bad typings
-        }
+        return stream.stream;
+      }
 
-        formats = formats
+      if (format?.mimeType?.slice(0, 5) !== 'audio') { // Legacy video
+        const formats = info.format
           .filter(format => format.averageBitrate)
           .sort((a, b) => {
             if (a && b) {
@@ -473,25 +482,17 @@ export default class {
 
             return 0;
           });
-        return formats.find(format => !format.bitrate) ?? formats[0];
-      };
+
+        format = formats.find(format => !format.bitrate) ?? formats[0];
+      }
 
       if (!format) {
-        format = nextBestFormat(info.formats);
-
-        if (!format) {
-          // If still no format is found, throw
-          throw new Error('Can\'t find suitable format.');
-        }
+        // If no format is found, throw
+        throw new Error('Can\'t find suitable format.');
       }
 
       debug('Using format', format);
-
-      ffmpegInput = format.url;
-
-      // Don't cache livestreams or long videos
-      const MAX_CACHE_LENGTH_SECONDS = 30 * 60; // 30 minutes
-      shouldCacheVideo = !info.player_response.videoDetails.isLiveContent && parseInt(info.videoDetails.lengthSeconds, 10) < MAX_CACHE_LENGTH_SECONDS && !options.seek;
+      ffmpegInput = format.url!;
 
       debug(shouldCacheVideo ? 'Caching video' : 'Not caching video');
 
@@ -597,6 +598,8 @@ export default class {
 
   private async createReadStream(options: {url: string; cacheKey: string; ffmpegInputOptions?: string[]; cache?: boolean; volumeAdjustment?: string}): Promise<Readable> {
     return new Promise((resolve, reject) => {
+      this.type = StreamType.WebmOpus;
+      this.loudness = 1;
       const capacitor = new WriteStream();
 
       if (options?.cache) {
@@ -638,7 +641,7 @@ export default class {
 
   private createAudioStream(stream: Readable) {
     return createAudioResource(stream, {
-      inputType: StreamType.WebmOpus,
+      inputType: this.type,
       inlineVolume: true,
     });
   }
@@ -653,6 +656,6 @@ export default class {
 
   private setAudioPlayerVolume(level?: number) {
     // Audio resource expects a float between 0 and 1 to represent level percentage
-    this.audioResource?.volume?.setVolume((level ?? this.getVolume()) / 100);
+    this.audioResource?.volume?.setVolume((level ? level * this.loudness : (this.getVolume()) / 100) * this.loudness);
   }
 }

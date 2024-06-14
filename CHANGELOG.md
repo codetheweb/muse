@@ -6,6 +6,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Switched ytdl-core to play-dl (should resolve issues with longer videos)
+
 ### Fixed
 - Audioplayer not stopping properly
 
